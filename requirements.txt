@@ -1,3 +1,4 @@
-Flask
-gunicorn
-pybit
+Flask==3.1.2
+gunicorn==23.0.0
+pybit==5.12.0
+websocket-client==1.8.0
