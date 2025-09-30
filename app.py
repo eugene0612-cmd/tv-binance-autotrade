@@ -1,239 +1,164 @@
 import os
 import math
-import logging
-from flask import Flask, request, jsonify
-
-# pybit v5 (unified trading)
+from flask import Flask, request, jsonify, abort
 from pybit.unified_trading import HTTP
 
-# -----------------------------------------------------------------------------
-# 기본 설정
-# -----------------------------------------------------------------------------
+# -------------------------
+# 환경변수 (Render에서 넣음)
+# -------------------------
+API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")          # Bybit Linear USDT Perp (예: BTCUSDT, ETHUSDT)
+LEVERAGE = int(os.getenv("LEVERAGE", "5"))       # 양방향 동일 레버리지 적용
+POSITION_USDT = float(os.getenv("POSITION_USDT", "50"))  # 1회 진입에 사용할 USDT
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "") # 트뷰 메시지의 secret과 일치해야 함
+USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() == "true"  # 메인넷: false
+
+# 메인넷 사용 (USE_TESTNET=False)
+client = HTTP(
+    testnet=USE_TESTNET,       # 메인넷이면 False, 테스트넷이면 True
+    api_key=API_KEY,
+    api_secret=API_SECRET
+)
+
 app = Flask(__name__)
-log = app.logger
-log.setLevel(logging.INFO)
 
-# 환경 변수
-BYBIT_API_KEY     = os.getenv("BYBIT_API_KEY", "").strip()
-BYBIT_API_SECRET  = os.getenv("BYBIT_API_SECRET", "").strip()
-USE_TESTNET       = os.getenv("USE_TESTNET", "true").strip().lower() in ("1", "true", "yes", "y")
-WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "").strip()           # 예: banya419!
-DEFAULT_SYMBOL    = os.getenv("SYMBOL", "BTCUSDT").upper()
-DEFAULT_LEVERAGE  = int(os.getenv("LEVERAGE", "5"))
-POSITION_USDT     = float(os.getenv("POSITION_USDT", "50"))           # 진입 노치널 (USDT)
-# 카테고리: 바이비트 선물(USDT 무기한)은 대부분 "linear"
-CATEGORY          = "linear"
-
-# -----------------------------------------------------------------------------
-# Bybit 클라이언트
-# -----------------------------------------------------------------------------
-def create_client():
-    """
-    pybit v5 unified trading 클라이언트 생성 (테스트넷/메인넷)
-    """
-    client = HTTP(
-        testnet=USE_TESTNET,
-        api_key=BYBIT_API_KEY or None,
-        api_secret=BYBIT_API_SECRET or None,
-    )
-    return client
-
-client = create_client()
-
-# -----------------------------------------------------------------------------
-# 유틸 함수
-# -----------------------------------------------------------------------------
+# --------- 유틸 ---------
 def get_mark_price(symbol: str) -> float:
-    """
-    현재가(틱커) 조회 (linear/USDT 무기한)
-    """
-    resp = client.get_tickers(category=CATEGORY, symbol=symbol)
-    # 응답 예시: {"retCode":0,"result":{"list":[{"lastPrice":"114000","..."}]}}
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"get_tickers failed: {resp}")
-    lst = resp.get("result", {}).get("list", [])
-    if not lst:
-        raise RuntimeError(f"ticker list empty: {resp}")
-    last_str = lst[0].get("lastPrice") or lst[0].get("markPrice")
-    if not last_str:
-        raise RuntimeError(f"no last/mark price in: {lst[0]}")
-    return float(last_str)
+    """현재 마크가격 (선물)"""
+    res = client.get_tickers(category="linear", symbol=symbol)
+    price = float(res["result"]["list"][0]["lastPrice"])
+    return price
 
-def ensure_leverage(symbol: str, lev: int):
-    """
-    심볼 레버리지 설정(롱/숏 동일 레버리지)
-    """
-    try:
-        client.set_leverage(
-            category=CATEGORY,
-            symbol=symbol,
-            buyLeverage=str(lev),
-            sellLeverage=str(lev),
-        )
-    except Exception as e:
-        # 레버리지 설정 실패해도 거래는 진행 가능하므로 경고로만 남김
-        log.warning(f"set_leverage warn: {e}")
+def set_leverage(symbol: str, lev: int):
+    """양방향 레버리지 설정 (Bybit는 buy/sell 따로)"""
+    client.set_leverage(category="linear", symbol=symbol,
+                        buyLeverage=str(lev), sellLeverage=str(lev))
 
-def get_position_qty_side(symbol: str):
+def get_position_side_qty(symbol: str):
     """
-    포지션 조회 → (side, qty) 반환
-    side: "Buy" / "Sell" / None  (없으면 qty=0)
-    qty : 현재 보유 수량(코인 단위, float)
+    현재 보유 포지션 조회.
+    return:
+      ("Long" or "Short" or None, qty_float)
     """
-    resp = client.get_positions(category=CATEGORY, symbol=symbol)
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"get_positions failed: {resp}")
-    data = resp.get("result", {}).get("list", [])
-    # unified v5: 포지션은 최대 2개 (Buy/Sell)로 나뉘어 제공될 수 있음
-    total_buy = 0.0
-    total_sell = 0.0
-    for p in data:
-        side = p.get("side")                  # "Buy" or "Sell"
-        sz   = float(p.get("size", "0") or 0) # 계약 수량(코인 단위)
-        if side == "Buy":
-            total_buy += sz
-        elif side == "Sell":
-            total_sell += sz
-    if total_buy > 0 and total_sell > 0:
-        # 허용하지 않을 구성(양방향 포지션) → 예외적으로 큰 쪽 기준으로 반환
-        if total_buy >= total_sell:
-            return "Buy", total_buy - total_sell
-        else:
-            return "Sell", total_sell - total_buy
-    elif total_buy > 0:
-        return "Buy", total_buy
-    elif total_sell > 0:
-        return "Sell", total_sell
-    else:
+    res = client.get_positions(category="linear", symbol=symbol)
+    items = res["result"]["list"]
+    side = None
+    qty = 0.0
+    # Bybit는 리스트로 포지션을 반환(롱/숏 각각 있을 수 있음). One-way면 한쪽만 존재.
+    for it in items:
+        sz = float(it.get("size", "0") or 0)
+        if sz > 0:
+            side = it.get("side")  # "Buy" or "Sell"
+            qty = sz
+            break
+    if side is None:
         return None, 0.0
+    return ("Long" if side == "Buy" else "Short"), qty
+
+def round_qty(symbol: str, qty: float) -> float:
+    """
+    BTCUSDT는 보통 0.001 스텝. 간단히 3자리로 반올림.
+    엄밀히 하려면 exchangeInfo로 lot size 확인 필요.
+    """
+    return max(0.0, round(qty, 3))
+
+def close_position(symbol: str, side_to_close: str, qty: float):
+    """reduce-only 시장가 청산"""
+    if qty <= 0:
+        return
+    if side_to_close == "Long":
+        # 롱 청산 → Sell reduce-only
+        client.place_order(category="linear", symbol=symbol,
+                           side="Sell", orderType="Market",
+                           reduceOnly=True, qty=str(qty))
+    elif side_to_close == "Short":
+        # 숏 청산 → Buy reduce-only
+        client.place_order(category="linear", symbol=symbol,
+                           side="Buy", orderType="Market",
+                           reduceOnly=True, qty=str(qty))
+
+def open_position(symbol: str, signal: str):
+    """
+    새 포지션 진입 (시장가).
+    수량은 (POSITION_USDT * LEVERAGE / mark_price) 로 산출.
+    """
+    price = get_mark_price(symbol)
+    raw_qty = (POSITION_USDT * LEVERAGE) / price
+    qty = round_qty(symbol, raw_qty)
+    if qty <= 0:
+        raise ValueError("계산된 수량이 0입니다. POSITION_USDT 또는 LEVERAGE 값을 확인하세요.")
+    if signal == "BUY":
+        client.place_order(category="linear", symbol=symbol,
+                           side="Buy", orderType="Market",
+                           qty=str(qty))
+    else:
+        client.place_order(category="linear", symbol=symbol,
+                           side="Sell", orderType="Market",
+                           qty=str(qty))
 
 def close_opposite_if_needed(symbol: str, signal: str):
     """
-    반대 포지션이 있으면 reduceOnly 시장가로 청산
+    반대포지션 있으면 전량 청산.
+    동일방향 이미 보유면 '재진입하지 않음'.
     """
-    cur_side, cur_qty = get_position_qty_side(symbol)
-    if cur_qty <= 0:
-        return
+    cur_side, cur_qty = get_position_side_qty(symbol)
+    if cur_side is None or cur_qty == 0:
+        return "empty", 0.0
 
-    # BUY 신호면 숏(Sell) 포지션 정리, SELL 신호면 롱(Buy) 정리
-    if signal == "BUY" and cur_side == "Sell":
-        # 숏 정리 → Buy reduceOnly
-        client.place_order(
-            category=CATEGORY,
-            symbol=symbol,
-            side="Buy",
-            orderType="Market",
-            qty=str(cur_qty),
-            reduceOnly=True,
-            timeInForce="IOC",
-        )
-        log.info(f"Closed SHORT {cur_qty} {symbol} (reduceOnly)")
-    elif signal == "SELL" and cur_side == "Buy":
-        # 롱 정리 → Sell reduceOnly
-        client.place_order(
-            category=CATEGORY,
-            symbol=symbol,
-            side="Sell",
-            orderType="Market",
-            qty=str(cur_qty),
-            reduceOnly=True,
-            timeInForce="IOC",
-        )
-        log.info(f"Closed LONG {cur_qty} {symbol} (reduceOnly)")
+    if signal == "BUY":
+        if cur_side == "Short":
+            close_position(symbol, "Short", cur_qty)
+            return "closed_short", cur_qty
+        else:
+            return "already_long", cur_qty
+    else:  # SELL
+        if cur_side == "Long":
+            close_position(symbol, "Long", cur_qty)
+            return "closed_long", cur_qty
+        else:
+            return "already_short", cur_qty
 
-def open_position(symbol: str, signal: str, usdt_notional: float):
-    """
-    신규 진입 (시장가)
-    POSITION_USDT(USDT) / 현재가 → 코인 수량(Qty) 계산
-    """
-    price = get_mark_price(symbol)
-    qty = usdt_notional / price
-    # 거래소 최소 수량 고려(소수 점절단). 안전하게 1e-6 단위 반올림
-    qty = float(f"{qty:.6f}")
-    if qty <= 0:
-        raise RuntimeError(f"Calculated qty <= 0 (price={price}, notional={usdt_notional})")
-
-    side = "Buy" if signal == "BUY" else "Sell"
-    resp = client.place_order(
-        category=CATEGORY,
-        symbol=symbol,
-        side=side,
-        orderType="Market",
-        qty=str(qty),
-        reduceOnly=False,
-        timeInForce="IOC",
-    )
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"place_order failed: {resp}")
-
-    log.info(f"Opened {side} {qty} {symbol} @~{price} (≈{usdt_notional} USDT)")
-
-# -----------------------------------------------------------------------------
-# 라우터
-# -----------------------------------------------------------------------------
+# ---------- 라우트 ----------
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    TradingView Webhook 엔드포인트
-    - body JSON 예시:
-      {
-        "secret": "banya419!",
-        "signal": "BUY",            // or "SELL"
-        "symbol": "BTCUSDT",
-        "timeframe": "1h",
-        "price": "{{close}}",
-        "time": "{{timenow}}",
-        "alert_name": "{{alert_name}}"
-      }
-    """
-    try:
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"status": "error", "message": "invalid JSON"}), 400
+    if not request.is_json:
+        return jsonify({"status": "error", "reason": "invalid json"}), 400
+    data = request.get_json(silent=True) or {}
 
-        # 시크릿 검증
-        if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
-            return jsonify({"status": "error", "message": "secret mismatch"}), 401
+    # 1) Secret 검사
+    if WEBHOOK_SECRET:
+        if data.get("secret") != WEBHOOK_SECRET:
+            return jsonify({"status": "error", "reason": "bad secret"}), 403
 
-        # 신호/심볼
-        signal     = str(data.get("signal", "")).upper()
-        symbol     = str(data.get("symbol", DEFAULT_SYMBOL)).upper()
-        timeframe  = str(data.get("timeframe", "")).lower()
-        alert_name = data.get("alert_name")
+    # 2) 파라미터
+    signal = str(data.get("signal", "")).upper()   # BUY/SELL
+    symbol = str(data.get("symbol", SYMBOL)).upper()
+    timeframe = str(data.get("timeframe", ""))
 
-        if signal not in ("BUY", "SELL"):
-            # 잘못된 신호는 무시(200 반환해 트뷰 알림 재시도 방지)
-            return jsonify({"status": "ignored", "reason": f"unknown signal {signal}"}), 200
+    if signal not in ("BUY", "SELL"):
+        return jsonify({"status": "error", "reason": "signal must be BUY or SELL"}), 400
 
-        # 레버리지 보장 (실패해도 거래 진행)
-        ensure_leverage(symbol, DEFAULT_LEVERAGE)
+    # 3) 메인넷인지 한번 더 확정(로그용)
+    if USE_TESTNET:
+        return jsonify({"status": "error", "reason": "server is running on TESTNET"}), 400
 
-        # 1) 반대 포지션 정리
-        close_opposite_if_needed(symbol, signal)
+    # 4) 레버리지 설정 (최초 1회 또는 매회 안전하게)
+    set_leverage(symbol, LEVERAGE)
 
-        # 2) 신규 진입
-        open_position(symbol, signal, POSITION_USDT)
+    # 5) 반대포지션 청산 / 동일방향이면 스킵
+    action, qty = close_opposite_if_needed(symbol, signal)
+    if action.startswith("already_"):
+        return jsonify({"status": "ok", "note": action, "symbol": symbol}), 200
 
-        return jsonify({
-            "status": "ok",
-            "executed": signal,
-            "symbol": symbol,
-            "tf": timeframe,
-            "note": "order placed",
-        }), 200
+    # 6) 새 진입
+    open_position(symbol, signal)
+    return jsonify({"status": "ok", "executed": signal, "symbol": symbol}), 200
 
-    except Exception as e:
-        log.exception("webhook error")
-        return jsonify({"status": "error", "message": str(e)}), 500
 
-# -----------------------------------------------------------------------------
-# 로컬 실행용 (Render에서는 gunicorn이 실행)
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    # 개발 로컬 테스트 시 True로. Render는 gunicorn 사용.
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
